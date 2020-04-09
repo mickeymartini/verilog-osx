@@ -1,0 +1,52 @@
+// VerilogA for rcn_sims, memristor, veriloga
+
+'include "constant.vams"
+'include "disciplines.vams"
+
+module memristor(p,n);
+  inout p,n;
+  electrical p,n;
+  parameter real d=0.9,A=1,T=0.55,F=20;
+  real Y;
+  real B;
+  real tau;
+  real RAstart;
+  real RAmin;
+  real RAmax;
+  real mA1;
+  real mA2;
+  real x;
+  real R;
+  real m1;
+  real m2;
+  real Rmin;
+  real Rmax;
+  
+  analog begin
+  
+  I(p,n) <+ V(p,n)/R;
+  Y = -0.95931;
+  B = 0.022295;
+  tau = -0.15497;
+  RAstart = (Y+B*exp(-d/tau));
+  RAmin = RAstart/2;
+  RAmax = RAstart*2;
+  mA1 = 0;
+  mA2 = RARAstart*F;
+  m1 = mA1/A;
+  m2 = mA2/A;
+  Rmin = RAmin/A;
+  Rmax = RAmax/A;
+  x = ((m2*V(p,n))+(0.5*(m1-m2)*(abs(V(p,n)+T)-abs(V(p,n)-T))));
+  R = idt(x,(RAstart/A));
+    if (R<Rmin)
+    begin
+      R = Rmin;
+    end
+    
+    if (R>Rmax)
+    begin
+      R = Rmax;
+    end
+ end
+endmodule
