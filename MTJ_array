@@ -1,0 +1,465 @@
+//This VerilogA program models the behavior of a multi-layer cell (MTJ) in a horizontal array.
+
+`include "constants.vams"
+
+nature Current
+units = "A";
+access = I;
+abstol = 1e-12;
+blowup = 1e32;
+endnature
+
+nature Voltage
+units = "V";
+access = V;
+abstol = 1e-12;
+blowup = 1e32;
+endnature
+
+discipline electrical
+potential Voltage;
+flow Current;
+enddiscipline
+
+discipline voltage
+potential Voltage;
+enddiscipline
+
+discipline current
+flow Current;
+enddiscipline
+
+nature Magnetic_induction
+abstol = 1e-12;
+access = H;
+units = "A/m";
+endnature
+
+discipline magnetic_ports
+potential Magnetic_induction;
+enddiscipline
+
+//rf and rp are the terminals of the free and the fixed layers.
+//a, mag_b, mag_c and mag_d are the 2-bit magnetic ports that are used to communicate with neighboring cells.
+//The magnetic ports are used to model the neighbor interaction among the free layers of the multi-layer cells.
+module mtj_horz_cell(rf,rp,mag_porta,mag_portb,mag_portc,mag_portd);
+
+inout rf,rp;
+inout [0:1]mag_porta,mag_portb,mag_portc,mag_portd;
+
+electrical rf,rp;
+magnetic_ports [0:1] mag_porta,mag_portb,mag_portc,mag_portd;
+
+
+//The gyromagnetic ratio
+`define gamma -1.76e11
+
+// Paramter constants:
+//Length, Width, thickness --- dimensions of the free layer of the MTJ.
+//alpha --- Gilbert damping factor.
+//R0 and R1 --- resistances of the logic 0 and logic 1 states.
+//P --- polarization factor.
+//gamma_p, alpha_p --- direction cosines of the magnetization of the reference layer along the x and z directioni.
+//Hd --- Coupling field from the reference layer onto the free layer.
+//Hk --- Anisotropy field.
+//Gp,Gap --- conductances of MTJ when the magnetization of the free layer is parallel and anti-parallel to the magnetization of the reference layer.
+//theta0 --- angle subtended by the magnetization of the reference layer with the z-axis.
+//I_delta --- deviation in the clocking current magnitude about the calculated value.
+
+//low, high --- low and high signal level for the magnetic ports.
+//V_delta --- differential voltage to determine the voltage across the device crossing the zero level.
+//tdelay, trise, tfall --- transition delay, rise time and fall time of the signal at the magnetic ports.
+//t_delta --- model the delay in the device to respond to the switching and clocking voltage pulse.
+
+
+parameter real  Length = 100e-9, 
+  Width = 50e-9,
+  thickness = 2e-9,
+  alpha = 0.01,
+  Ms = 8e5, //in A/m
+  R0 = 412.72, //in ohms
+  R1 = 423.13, //in ohms 
+  P=0.35,
+  gamma_p = 0.707,
+  alpha_p = 0.707,
+  Hd = 5000, //in A/m
+  Hk = 795.77, //in A/m
+  I_upper=200e-6, //in A
+  Gp = 2.82e-3, //in mho
+  Gap = 1.967e-3, //in mho
+  theta0 = `M_PI/4,
+  I_delta = 1e-6; //in A
+
+parameter real low=0,
+  high=1,
+  V_delta=10e-3;
+
+parameter real tdelay=2p from [0:inf),
+  trise=1p from [0:inf),
+  tfall = 1p from [0:inf),
+  t_delta = 1p from [0:inf);
+
+
+electrical int_nodea,int_nodeb;
+real Resistance,I_max,I_prev,tpulse,t_prev_pulse;
+real theta,Volume,t_precession,I_switch,fsm_out;
+real trise_pos,tfall_neg,tfall_pos,trise_neg,tswitch;
+real g,geff,aj_piby2,Iclk;
+
+integer out[0:1],out_prev[0:1];
+integer value_porta[0:1],value_portb[0:1],value_portc[0:1];
+integer switch_out,switch_prev_out,clocked;
+
+
+
+// This function computes the critical switching current for a multi-layer stack with the given device specifications.
+
+
+analog function real critical_switching_current;
+
+input Volume,I_rfrp;
+real Volume,I_rfrp,eta;
+begin
+  if(I_rfrp < 0) begin
+  eta = P/(1+pow(P,2));
+  critical_switching_current = (2*`P_Q/(`P_H/(2*`M_PI)))*(alpha*Ms*Volume/eta)*`P_U0*(Ms/(2*sqrt(2)));
+  end
+  else begin
+  eta = P/(1-pow(P,2));
+  critical_switching_current = (2*`P_Q/(`P_H/(2*`M_PI)))*(alpha*Ms*Volume/eta)*`P_U0*(Ms/(2*sqrt(2)));
+  end
+end
+endfunction
+
+
+
+// This function computes the angle of magnetization of the free layer of the multi-layer device as function of the current through it.
+
+
+analog function real angle;
+
+input aj_piby2;
+real aj_piby2,cos_angle;
+begin
+ cos_angle = (Hd*gamma_p*(4*`M_PI/1e7) - aj_piby2/alpha)/((4*`M_PI*Ms + 0.5*Hk)*(4*`M_PI/1e7));
+ angle = acos(cos_angle);
+end
+endfunction
+
+
+
+// This function computes the resistance of the multi-layer stack as a function of the angle of magnetization of the free layer.
+
+
+analog function real resistance;
+
+input theta;
+real theta,G_theta;
+begin
+ G_theta = 0.5*((1+cos(theta))*Gp + (1-cos(theta))*Gap);
+ resistance = 1/G_theta; 
+end
+endfunction
+
+
+// This function computes the magnitude of the clocking current that is required to align the magnetization of the free layer along the y-axis into a
+// stationary magnetization state.
+
+
+analog function real clocking_current;
+
+input Volume;
+real Volume;
+real Hdz,G,Jp;
+begin
+ Hdz = Hd*cos(theta0);
+ 
+ G = 1/(-4 + (pow((1+P),3))*3/(4*pow(P,1.5)));
+ Jp = `P_U0*(pow(Ms,2))*(`P_Q)*Volume/((`P_H)/(2*`M_PI));
+
+ clocking_current = Hdz*Jp/(G*(sin(theta0))*Ms);
+end
+endfunction
+
+
+// This function is used to compute the post-clocking neighbor interaction among the free layers of the neighboring multi-layer cells.
+// The neighbor interaction is implemented as a Finite State Machine.
+
+
+analog function real mtj_fsm_horz_cell;
+
+input [0:1] value_porta,value_portb,value_portc;
+integer value_porta[0:1],value_portb[0:1],value_portc[0:1];
+integer portb_and,porta_and,portb_xor_porta;
+integer bitwise_xor[0:2];
+
+integer out1[0:1],out2[0:1],out3[0:1],out[0:1];
+begin
+ bitwise_xor[0] = (value_porta[0] ^ value_porta[1]);
+ bitwise_xor[1] = (value_portb[0] ^ value_portb[1]);
+ bitwise_xor[2] = (value_portc[0] ^ value_portc[1]);
+
+ portb_and = (value_portb[0] && value_portb[1]);
+ porta_and = (value_porta[0] && value_porta[1]);
+ portb_xor_porta = portb_and ^ porta_and;
+
+ out1[0] = value_portc[0] && value_portb[0];
+ out1[1] = value_portc[1] && value_portb[1];
+
+ out2[0] = (value_portb[0] ^ value_portc[0]);
+ out2[1] = (value_portb[1] ^ value_portc[1]);
+ 
+ out3[0] = !value_porta[0];
+ out3[1] = !value_porta[1];
+
+ out2[0] = out2[0] && out3[0];
+ out2[1] = out2[1] && out3[1];
+ 
+ out1[0] = out1[0] || out2[0];
+ out1[1] = out1[1] || out2[1];
+
+ if(bitwise_xor[0]) begin
+  if(bitwise_xor[1] && bitwise_xor[2]) begin
+   out[0] = low;
+   out[1] = high;
+  end
+  else if(bitwise_xor[1]) begin
+   out[0] = value_portc[0];
+   out[1] = value_portc[1];
+  end
+  else if(bitwise_xor[2]) begin
+   out[0] = !value_portb[0];
+   out[1] = !value_portb[1];
+  end
+  else begin
+   out[0] = value_portc[0];
+   out[1] = value_portc[1];
+  end
+ end
+ else begin
+  if(bitwise_xor[1] && bitwise_xor[2]) begin
+   out[0] = !(value_porta[0]);
+   out[1] = !(value_porta[1]);
+  end
+  else if(bitwise_xor[1])
+  begin
+   out[0] = value_portc[0];
+   out[1] = value_portc[1];
+  end
+  else if(bitwise_xor[2]) begin
+   if(portb_xor_porta) begin
+    out[0] = low;
+    out[1] = high;
+   end
+   else begin
+    out[0] = !(value_porta[0]);
+    out[1] = !(value_porta[1]);
+   end
+  end
+  else begin
+   out[0] = out1[0];
+   out[1] = out1[1];
+  end
+ end
+
+ if(out[0] ^ out[1])
+  mtj_fsm_horz_cell = 0.5;
+ else begin
+  if(out[0] == 0)
+   mtj_fsm_horz_cell = 0.0;
+  else
+   mtj_fsm_horz_cell = 1.0;
+ end
+  
+end
+endfunction
+
+
+// This function is used to decide the specific writing or clocking or no operation that needs to be performed on the cell.
+// The specific operation that needs to be performed depends on the magnitude of the current through the cell and the duration of the current pulse.
+
+
+analog function integer switch_output;
+
+input [0:1]out_prev,switch_prev_out;
+input I_switch, Iclk, t_precession, tpulse, I_max;
+integer out_prev[0:1],switch_prev_out;
+real I_switch,Iclk,t_precession,tpulse,I_max;
+integer out[0:1];
+real Imax_abs,Iswitch_abs;
+
+begin
+Imax_abs = abs(I_max);
+Iswitch_abs = abs(I_switch);
+
+  if(abs(Imax_abs - Iclk) < I_delta) begin
+   if(I_max > 0) begin
+    out[0] = high;
+    out[1] = low;
+    switch_output = 01;
+   end
+   else begin
+    out[0] = out_prev[0];
+    out[1] = out_prev[1];
+    switch_output = 10;
+   end
+  end
+  else if((Imax_abs > Iswitch_abs) && (tpulse > t_precession/2)) begin
+   if(I_max < 0) begin
+    out[0] = high;
+    out[1] = high;
+    switch_output = 11;
+   end
+   else begin
+    out[0] = low;
+    out[1] = low;
+    switch_output = 00;
+   end
+  end
+  else begin
+   out[0] = out_prev[0];
+   out[1] = out_prev[1];
+   switch_output = switch_prev_out;
+  end
+end  
+endfunction
+
+
+// Main body of the program.
+
+
+analog
+begin
+ 
+ Volume = Length*Width*thickness;
+ t_precession = abs(`M_PI/`gamma);
+ geff = sqrt(P) + 1/sqrt(P);
+ g = 1/(-4 + (pow(geff,3))*0.75);
+ aj_piby2 = ((`P_H/(2*`M_PI))/(2*`P_Q))*g*I(rf,rp)/(Ms*Volume);
+ theta = angle(aj_piby2);
+ Resistance = resistance(theta) ;
+ I_switch = critical_switching_current(Volume,I(rf,rp));
+ Iclk = clocking_current(Volume);
+
+@(initial_step) begin
+ trise_pos = 0;
+ tfall_pos = 0;
+ tfall_neg = 0;
+ trise_neg = 0;
+ tswitch = 0;
+ out[0] = high;
+ out[1] = high;
+ out_prev[0] = out[0];
+ out_prev[1] = out[1];
+ clocked = 0;
+ Resistance = R0;
+ I_prev = 0;
+ t_prev_pulse = 0;
+ switch_prev_out = 10;
+end
+
+@(cross(V(rf,rp) - V_delta,+1)) begin
+ trise_pos = $abstime;
+end
+
+@(cross(V(rf,rp) + V_delta,-1)) begin
+ tfall_neg = $abstime;
+end
+
+@(cross(V(rf,rp) - V_delta,-1)) begin
+ tfall_pos = $abstime;
+ t_prev_pulse = tpulse;
+ tpulse = tfall_pos - trise_pos;
+ tswitch = tfall_pos + t_delta;
+end
+
+@(cross(V(rf,rp) + V_delta,+1)) begin
+ trise_neg = $abstime;
+ t_prev_pulse = tpulse;
+ tpulse = trise_neg - tfall_neg;
+ tswitch = trise_neg + t_delta;
+end
+
+if (tpulse < 1.5e-12) begin
+ tpulse = t_prev_pulse;
+end
+
+
+@(timer(tswitch)) begin
+
+switch_out = switch_output(out_prev,switch_prev_out,I_switch,Iclk,t_precession,tpulse,I_max);
+
+switch_prev_out = switch_out;
+ case (switch_out)
+ 00 : begin out[0] = low; out[1] = low; clocked=0; end
+ 11 : begin out[0] = high; out[1] = high; clocked=0; end
+ 01 : begin out[0] = high; out[1] = low; clocked=1; end
+ default : begin out[0] = out_prev[0]; out[1] = out_prev[1]; clocked=0; end
+ endcase
+
+end
+
+
+ V(int_nodea,int_nodeb) <+ ddt(V(rf,rp));
+ if((abs(V(int_nodea,int_nodeb)) < 2e10) && ((abs(I(rf,rp))>I_upper) || (abs(I(rf,rp)-Iclk)
+  I_max = I(rf,rp);
+  I_prev = I_max;
+ end
+ else begin
+  I_max = I_prev;
+ end
+
+
+ value_porta[0] = (H(mag_porta[0]) > 0);
+ value_porta[1] = (H(mag_porta[1]) > 0);
+ value_portb[0] = (H(mag_portb[0]) > 0);
+ value_portb[1] = (H(mag_portb[1]) > 0);
+ value_portc[0] = (H(mag_portc[0]) > 0);
+ value_portc[1] = (H(mag_portc[1]) > 0);
+
+
+H(mag_portd[0]) <+ transition(out[0],tdelay,trise,tfall);
+H(mag_portd[1]) <+ transition(out[1],tdelay,trise,tfall);
+
+
+
+
+ if(clocked == 1) begin
+
+ fsm_out = mtj_fsm_horz_cell(value_porta,value_portb,value_portc);
+  if((fsm_out - 0.5) == 0) begin
+   out[0] = low;
+   out[1] = high;
+  end
+  else if(fsm_out == 1) begin
+   out[0] = high;
+   out[1] = high;
+  end
+  else begin
+   out[0] = low;
+   out[1] = low;
+  end
+ clocked = 0;
+ end
+ 
+ out_prev[0] = out[0];
+ out_prev[1] = out[1];
+
+
+ if(out[0] ^ out[1]) begin
+  Resistance = resistance(theta);
+ end
+ else begin
+  if(out[0] == 0) begin
+   Resistance = R0;
+  end
+  else begin
+   Resistance = R1;
+  end
+ end
+ I(rf,rp) <+ V(rf,rp)/Resistance;
+
+end
+  
+endmodule
+
